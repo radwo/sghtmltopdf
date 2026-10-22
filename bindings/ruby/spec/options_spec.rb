@@ -43,6 +43,28 @@ RSpec.describe Sghtmltopdf::Options do
         .to eq(["--user-style-sheet", "/tmp/a.css"])
     end
 
+    it "converts a Time to ISO 8601 in UTC" do
+      time = Time.new(2026, 10, 22, 10, 30, 0, "+02:00")
+      expect(argv(creation_date: time)).to eq(["--creation-date", "2026-10-22T08:30:00Z"])
+    end
+
+    it "converts a DateTime to ISO 8601 in UTC" do
+      datetime = DateTime.new(2026, 10, 22, 10, 30, 0, "-05:00")
+      expect(argv(creation_date: datetime)).to eq(["--creation-date", "2026-10-22T15:30:00Z"])
+    end
+
+    it "passes a Date as a calendar date and a String as it is" do
+      expect(argv(creation_date: Date.new(2026, 10, 22))).to eq(["--creation-date", "2026-10-22"])
+      expect(argv(creation_date: "2026-10-22T10:30:00+02:00"))
+        .to eq(["--creation-date", "2026-10-22T10:30:00+02:00"])
+    end
+
+    it "sends the converted date in the server query too" do
+      time = Time.new(2026, 10, 22, 10, 30, 0, "+02:00")
+      expect(described_class.to_query(creator: "Acme Reports", creation_date: time))
+        .to eq("creator=Acme+Reports&creation-date=2026-10-22T08%3A30%3A00Z")
+    end
+
     it "turns an array into a repeated option" do
       expect(argv(allow_path: ["/a", "/b"])).to eq(["--allow-path", "/a", "--allow-path", "/b"])
     end

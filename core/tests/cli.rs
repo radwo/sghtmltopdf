@@ -666,6 +666,178 @@ fn author_subject_and_keywords_are_written_when_given() {
 }
 
 #[test]
+fn creator_and_creation_date_are_written_when_given() {
+    // The offset is converted to UTC; `/ModDate` repeats the creation date.
+    let bytes = run_cli_with(
+        PLAIN_HTML,
+        &[
+            "--creator",
+            "Acme Reports",
+            "--creation-date",
+            "2026-10-22T10:30:00+02:00",
+        ],
+        "creator-date",
+    );
+    assert!(count_occurrences(&bytes, b"/Creator (Acme Reports)") > 0);
+    assert!(count_occurrences(&bytes, b"/CreationDate (D:20261022083000Z)") > 0);
+    assert!(count_occurrences(&bytes, b"/ModDate (D:20261022083000Z)") > 0);
+}
+
+#[test]
+fn without_a_creation_date_the_wall_clock_is_used_and_no_creator_is_written() {
+    let bytes = run_cli_with(PLAIN_HTML, &[], "no-creator");
+    assert_eq!(count_occurrences(&bytes, b"/Creator"), 0);
+    assert!(count_occurrences(&bytes, b"/CreationDate (D:") > 0);
+    assert!(count_occurrences(&bytes, b"/ModDate (D:") > 0);
+}
+
+#[test]
+fn a_creation_date_makes_the_output_reproducible_in_both_writers() {
+    let html = "<html><head><title>t</title></head><body><p>hello</p></body></html>";
+    for (streaming, name) in [(false, "repro-batch"), (true, "repro-streaming")] {
+        let mut args = vec![
+            "--author",
+            "waka",
+            "--creation-date",
+            "2026-01-02T03:04:05Z",
+        ];
+        if streaming {
+            args.push("--streaming");
+        }
+        let first = run_cli_with(html, &args, name);
+        // Cross a second boundary so a wall-clock leak would show.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let second = run_cli_with(html, &args, name);
+        assert_eq!(first, second, "{name}: same input, same bytes");
+    }
+}
+
+#[test]
+fn the_creation_date_changes_the_file_identifier() {
+    let id_of = |date: &str, name: &str| {
+        let bytes = run_cli_with(PLAIN_HTML, &["--creation-date", date], name);
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        text.split_once("/ID [<").unwrap().1[..32].to_string()
+    };
+    assert_ne!(
+        id_of("2026-01-02T03:04:05Z", "id-date-a"),
+        id_of("2026-01-02T03:04:06Z", "id-date-b")
+    );
+}
+
+#[test]
+fn a_creation_date_is_parsed_as_iso_8601() {
+    for (value, expected) in [
+        ("2026-10-22", "D:20261022000000Z"),
+        ("2026-10-22T08:30Z", "D:20261022083000Z"),
+        ("2026-10-22 08:30:15.75Z", "D:20261022083015Z"),
+        ("2026-10-22T08:30:15-05:30", "D:20261022140015Z"),
+        ("2026-10-22T08:30:15", "D:20261022083015Z"),
+    ] {
+        let bytes = run_cli_with(PLAIN_HTML, &["--creation-date", value], "date-forms");
+        let needle = format!("/CreationDate ({expected})");
+        assert!(
+            count_occurrences(&bytes, needle.as_bytes()) > 0,
+            "{value} should give {expected}"
+        );
+    }
+}
+
+#[test]
+fn a_bad_creation_date_is_a_usage_error() {
+    for value in [
+        "yesterday",
+        "2026-13-01",
+        "2026-02-30",
+        "2026-10-22T25:00:00Z",
+        "2026-10-22T08:30:15+24:00",
+    ] {
+        let out = Command::new(BIN)
+            .arg(SAMPLE_HTML)
+            .arg("--font")
+            .arg(FONT_PATH)
+            .args(["--creation-date", value])
+            .arg("-o")
+            .arg(temp_output_path("bad-date"))
+            .output()
+            .expect("failed to run sghtmltopdf binary");
+        assert_eq!(out.status.code(), Some(1), "{value} should be rejected");
+    }
+}
+
+/// The text of the XMP packet, found through the catalog's `/Metadata` entry.
+fn xmp_packet(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes).into_owned();
+    assert!(text.contains("/Type /Metadata"), "the XMP stream is typed");
+    assert!(text.contains("/Subtype /XML"));
+    let catalog = &text[text.find("/Type /Catalog").expect("a catalog")..];
+    assert!(
+        catalog[..catalog.find(">>").unwrap()].contains("/Metadata "),
+        "the catalog should point at the XMP stream"
+    );
+    let start = text.find("<?xpacket begin").expect("an XMP packet");
+    let end = text.find("<?xpacket end").expect("the packet end");
+    text[start..end + text[end..].find("?>").unwrap() + 2].to_string()
+}
+
+#[test]
+fn the_xmp_stream_mirrors_the_info_fields() {
+    for (args, name) in [
+        (&[][..], "xmp-batch"),
+        (&["--streaming"][..], "xmp-streaming"),
+    ] {
+        let mut all = vec![
+            "--title",
+            "Raport Zażółć",
+            "--author",
+            "Владимир Путин",
+            "--subject",
+            "A & B <c>",
+            "--keywords",
+            "pdf, \"rust\"",
+            "--creator",
+            "Acme Reports",
+            "--creation-date",
+            "2026-10-22T10:30:00+02:00",
+        ];
+        all.extend_from_slice(args);
+        let xmp = xmp_packet(&run_cli_with(PLAIN_HTML, &all, name));
+        for expected in [
+            "<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Raport Zażółć</rdf:li></rdf:Alt></dc:title>",
+            "<dc:creator><rdf:Seq><rdf:li>Владимир Путин</rdf:li></rdf:Seq></dc:creator>",
+            "<rdf:li xml:lang=\"x-default\">A &amp; B &lt;c&gt;</rdf:li>",
+            "<pdf:Keywords>pdf, \"rust\"</pdf:Keywords>",
+            "<xmp:CreatorTool>Acme Reports</xmp:CreatorTool>",
+            "<pdf:Producer>sghtmltopdf ",
+            "<xmp:CreateDate>2026-10-22T08:30:00Z</xmp:CreateDate>",
+            "<xmp:ModifyDate>2026-10-22T08:30:00Z</xmp:ModifyDate>",
+        ] {
+            assert!(xmp.contains(expected), "{name}: missing {expected} in {xmp}");
+        }
+        assert!(
+            !xmp.contains("pdfaid"),
+            "PDF/A identification is not written yet"
+        );
+    }
+}
+
+#[test]
+fn the_xmp_stream_omits_fields_that_were_not_given() {
+    let xmp = xmp_packet(&run_cli_with(PLAIN_HTML, &[], "xmp-minimal"));
+    for absent in [
+        "dc:title",
+        "dc:creator",
+        "dc:description",
+        "pdf:Keywords",
+        "xmp:CreatorTool",
+    ] {
+        assert!(!xmp.contains(absent), "{absent} should be absent: {xmp}");
+    }
+    assert!(xmp.contains("<pdf:Producer>"));
+    assert!(xmp.contains("<xmp:CreateDate>"));
+}
+
+#[test]
 fn no_pdf_compression_removes_every_flate_filter() {
     let compressed = run_cli_with(PLAIN_HTML, &[], "compressed");
     let plain = run_cli_with(PLAIN_HTML, &["--no-pdf-compression"], "uncompressed");

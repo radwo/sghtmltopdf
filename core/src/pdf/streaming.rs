@@ -34,6 +34,7 @@ use super::document::{
 use super::font::{deflate, embed_font_streaming_chunks, FontUsage};
 use super::img::{embed_image_streaming_chunks, ids_for_image, ImageIds, PreparedImage};
 use super::options::PdfOutputOptions;
+use super::xmp::xmp_packet;
 
 const PDF_HEADER: &[u8] = b"%PDF-1.7\n%\x80\x80\x80\x80\n\n";
 
@@ -511,6 +512,9 @@ impl<S: Sink> StreamingPdfWriter<S> {
             self.write_chunk(dests_id, &chunk)?;
         }
 
+        // One instant for the Info dictionary, the XMP stream and the `/ID`.
+        let datetime = self.output.metadata.datetime();
+        let metadata_id = self.alloc.next();
         let mut chunk = Chunk::new();
         {
             let mut catalog = chunk.indirect(self.catalog_id).start::<Catalog>();
@@ -518,8 +522,13 @@ impl<S: Sink> StreamingPdfWriter<S> {
             if let Some(dests_id) = dests_id {
                 catalog.destinations(dests_id);
             }
+            catalog.metadata(metadata_id);
         }
         self.write_chunk(self.catalog_id, &chunk)?;
+
+        let mut chunk = Chunk::new();
+        chunk.metadata(metadata_id, &xmp_packet(&self.output.metadata, datetime));
+        self.write_chunk(metadata_id, &chunk)?;
 
         let info_id = self.alloc.next();
         let mut chunk = Chunk::new();
@@ -528,10 +537,11 @@ impl<S: Sink> StreamingPdfWriter<S> {
                 .indirect(info_id)
                 .start::<pdf_writer::writers::DocumentInfo>(),
             &self.output.metadata,
+            datetime,
         );
         self.write_chunk(info_id, &chunk)?;
 
-        self.write_xref_and_trailer(info_id)?;
+        self.write_xref_and_trailer(info_id, datetime)?;
 
         self.sink.finish()
     }
@@ -554,7 +564,11 @@ impl<S: Sink> StreamingPdfWriter<S> {
         self.sink.write(bytes)
     }
 
-    fn write_xref_and_trailer(&mut self, info_id: Ref) -> Result<(), S::Error> {
+    fn write_xref_and_trailer(
+        &mut self,
+        info_id: Ref,
+        datetime: (i64, u32, u32, u32, u32, u32),
+    ) -> Result<(), S::Error> {
         let xref_offset = self.output_len;
         let size = self
             .offsets
@@ -575,7 +589,7 @@ impl<S: Sink> StreamingPdfWriter<S> {
         // `/ID` (the file identifier) is built the same way as in the batch writer.
         // We write the trailer ourselves here rather than through `pdf_writer::Pdf`, so it is
         // written directly as a hex string (the same value as a byte string).
-        let id: String = file_identifier(&self.output.metadata, self.page_ids.len())
+        let id: String = file_identifier(&self.output.metadata, datetime, self.page_ids.len())
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect();

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require "date"
 require "uri"
 
 module Sghtmltopdf
@@ -78,6 +79,11 @@ module Sghtmltopdf
       when true then [[name, nil]]
       # An array means the same option repeated. The same rule applies to each element.
       when Array then value.flat_map { |element| pairs_for(key, element) }
+      # `creation_date:` takes a moment in time. The CLI wants it as ISO 8601, so it is
+      # converted to UTC here rather than left to `to_s`, which would drop the zone for a Time
+      # and the subsecond part of a DateTime.
+      when Time, DateTime then [[name, value.to_time.getutc.iso8601]]
+      when Date then [[name, value.iso8601]]
       when Hash
         # Nesting such as wicked_pdf's `margin: {top: 10}` is not accepted. There is no
         # corresponding CLI flag, and flattening it mechanically would let even misspelled
