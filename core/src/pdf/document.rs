@@ -63,6 +63,7 @@ use crate::style::{
 };
 
 use super::color_font::{write_color_fonts, FontPlan};
+use super::file_id::{id_entry, FileIdHasher};
 use super::font::{deflate, embed_font, FontUsage};
 use super::img::{embed_image, ids_for_image, image_resource_name, ImageIds, PreparedImage};
 use super::options::{producer_string, DocumentMetadata, PdfOutputOptions};
@@ -417,10 +418,24 @@ pub fn encode_pdf_with_options(
     let info_id = alloc.next();
     write_document_info(pdf.document_info(info_id), &output.metadata, datetime);
 
-    let id = file_identifier(&output.metadata, datetime, pages.len());
-    pdf.set_file_id((id.clone(), id));
+    with_file_identifier(pdf.finish())
+}
 
-    pdf.finish()
+/// Add the `/ID` to the trailer of a finished PDF.
+///
+/// The identifier hashes everything before the trailer, which is only known once the file is
+/// finished, so it is spliced into the trailer dictionary afterwards. The xref offsets all
+/// point before the trailer and are unaffected.
+fn with_file_identifier(mut bytes: Vec<u8>) -> Vec<u8> {
+    let find_last = |needle: &[u8]| bytes.windows(needle.len()).rposition(|w| w == needle);
+    let trailer = find_last(b"trailer\n").expect("pdf_writer writes a trailer");
+    let dict_end = find_last(b">>\nstartxref").expect("pdf_writer closes the trailer dictionary");
+
+    let mut hasher = FileIdHasher::new();
+    hasher.update(&bytes[..trailer]);
+    let entry = format!("  {}\n", id_entry(&hasher.digest()));
+    bytes.splice(dict_end..dict_end, entry.into_bytes());
+    bytes
 }
 
 /// Write one `/Link` annotation. An internal anchor (`#id`) writes a named destination
@@ -526,42 +541,6 @@ pub fn write_document_with_options<S: Sink>(
     );
     sink.write(&bytes)?;
     sink.finish()
-}
-
-/// The `/ID` (file identifier) written in the trailer.
-///
-/// The PDF spec makes it an array of two strings: the first a permanent identifier fixed
-/// when the document is created, the second one that changes on every update. This crate
-/// performs no incremental updates, so the same value is written for both.
-///
-/// The spec says nothing about the contents beyond being unique per document. Sixteen bytes
-/// are built from a hash mixing the same metadata, creation date and page count written to
-/// the Info dictionary. PDF/A requires a file identifier, so without one it does not conform.
-pub(super) fn file_identifier(
-    metadata: &DocumentMetadata,
-    datetime: (i64, u32, u32, u32, u32, u32),
-    page_count: usize,
-) -> Vec<u8> {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut id = Vec::with_capacity(16);
-    // Two 64-bit hashes joined to make 16 bytes (a different salt gives a different value).
-    for salt in [0u64, 0x9e37_79b9_7f4a_7c15] {
-        let mut hasher = DefaultHasher::new();
-        salt.hash(&mut hasher);
-        producer_string().hash(&mut hasher);
-        metadata.title.hash(&mut hasher);
-        metadata.author.hash(&mut hasher);
-        metadata.subject.hash(&mut hasher);
-        metadata.keywords.hash(&mut hasher);
-        metadata.creator.hash(&mut hasher);
-        datetime.hash(&mut hasher);
-        page_count.hash(&mut hasher);
-        // `pdf_writer::Finish` is also in scope, so which `finish` is meant is made explicit.
-        id.extend_from_slice(&Hasher::finish(&hasher).to_be_bytes());
-    }
-    id
 }
 
 /// Write the PDF Info dictionary. `/Producer`, `/CreationDate` and `/ModDate` are always

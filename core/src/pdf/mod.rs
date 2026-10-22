@@ -2,6 +2,7 @@
 
 mod color_font;
 mod document;
+mod file_id;
 mod font;
 mod img;
 mod options;

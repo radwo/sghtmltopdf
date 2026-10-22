@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require "date"
+# `Time#iso8601` comes from here before Ruby 3.4 (Rails loads it, a plain Ruby script may not).
+require "time"
 require "uri"
 
 module Sghtmltopdf

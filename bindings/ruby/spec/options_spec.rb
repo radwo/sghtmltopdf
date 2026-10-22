@@ -48,6 +48,17 @@ RSpec.describe Sghtmltopdf::Options do
       expect(argv(creation_date: time)).to eq(["--creation-date", "2026-10-22T08:30:00Z"])
     end
 
+    it "converts a Time without anything else loaded (Time#iso8601 needs `require \"time\"` before Ruby 3.4)" do
+      require "open3"
+      script = 'require "sghtmltopdf/options"; ' \
+               'print Sghtmltopdf::Options.to_argv(creation_date: Time.at(0)).last'
+      out, err, status = Open3.capture3(
+        {"RUBYOPT" => nil}, RbConfig.ruby, "--disable-gems", "-I", File.expand_path("../lib", __dir__), "-e", script
+      )
+      expect(status).to be_success, err
+      expect(out).to eq("1970-01-01T00:00:00Z")
+    end
+
     it "converts a DateTime to ISO 8601 in UTC" do
       datetime = DateTime.new(2026, 10, 22, 10, 30, 0, "-05:00")
       expect(argv(creation_date: datetime)).to eq(["--creation-date", "2026-10-22T15:30:00Z"])

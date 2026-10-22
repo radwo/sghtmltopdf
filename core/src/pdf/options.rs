@@ -194,7 +194,10 @@ pub fn unix_from_iso8601(text: &str) -> Result<i64, String> {
             Some(i) => (&rest[..i], &rest[i..]),
             None => (rest, ""),
         };
-        let (clock, _fraction) = clock.split_once('.').unwrap_or((clock, "0"));
+        let (clock, fraction) = match clock.split_once('.') {
+            Some((clock, fraction)) => (clock, Some(fraction)),
+            None => (clock, None),
+        };
         let mut fields = clock.split(':');
         let mut field = |max: i64| -> Result<i64, String> {
             let part = fields.next().ok_or_else(bad)?;
@@ -209,13 +212,36 @@ pub fn unix_from_iso8601(text: &str) -> Result<i64, String> {
         } else {
             0
         };
+        // Exactly HH:MM or HH:MM:SS, and a fraction only after the seconds.
+        if fields.next().is_some() {
+            return Err(bad());
+        }
+        if let Some(fraction) = fraction {
+            if clock.matches(':').count() != 2
+                || fraction.is_empty()
+                || !fraction.bytes().all(|b| b.is_ascii_digit())
+            {
+                return Err(bad());
+            }
+        }
         seconds_of_day = hour * 3600 + minute * 60 + second;
 
         offset = match zone {
             "" | "Z" | "z" => 0,
             _ => {
-                let sign = if zone.starts_with('-') { -1 } else { 1 };
-                let digits: String = zone[1..].chars().filter(|c| *c != ':').collect();
+                let sign = match zone.as_bytes()[0] {
+                    b'+' => 1,
+                    b'-' => -1,
+                    _ => return Err(bad()),
+                };
+                // `HH`, `HHMM` or `HH:MM`.
+                let digits = match zone[1..].split_once(':') {
+                    Some((hours, minutes)) if hours.len() == 2 && minutes.len() == 2 => {
+                        format!("{hours}{minutes}")
+                    }
+                    Some(_) => return Err(bad()),
+                    None => zone[1..].to_string(),
+                };
                 if !matches!(digits.len(), 2 | 4) || !digits.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(bad());
                 }

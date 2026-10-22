@@ -726,6 +726,33 @@ fn the_creation_date_changes_the_file_identifier() {
 }
 
 #[test]
+fn the_file_identifier_covers_the_document_content() {
+    // Same metadata, same date, same page count: only the text differs.
+    for (args, name) in [
+        (&[][..], "id-content-batch"),
+        (&["--streaming"][..], "id-content-streaming"),
+    ] {
+        let mut all = vec!["--title", "t", "--creation-date", "2026-01-02T03:04:05Z"];
+        all.extend_from_slice(args);
+        let id_of = |html: &str| {
+            let bytes = run_cli_with(html, &all, name);
+            String::from_utf8_lossy(&bytes)
+                .split_once("/ID [<")
+                .unwrap()
+                .1[..32]
+                .to_string()
+        };
+        let a = id_of("<html><body><p>first</p></body></html>");
+        assert_eq!(a, id_of("<html><body><p>first</p></body></html>"));
+        assert_ne!(
+            a,
+            id_of("<html><body><p>second</p></body></html>"),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn a_creation_date_is_parsed_as_iso_8601() {
     for (value, expected) in [
         ("2026-10-22", "D:20261022000000Z"),
@@ -751,6 +778,10 @@ fn a_bad_creation_date_is_a_usage_error() {
         "2026-02-30",
         "2026-10-22T25:00:00Z",
         "2026-10-22T08:30:15+24:00",
+        "2026-10-22T10:00:00:99",
+        "2026-10-22T10:00:00.abc",
+        "2026-10-22T10:00:00+",
+        "2026-10-22T10:00:00Z+02:00",
     ] {
         let out = Command::new(BIN)
             .arg(SAMPLE_HTML)
@@ -1353,14 +1384,17 @@ fn inline_header_footer_html_matches_file_input() {
         let file = render(file_option, path.to_str().unwrap());
         let inline = render(content_option, html);
         assert_eq!(count_occurrences(&inline, b"/MediaBox"), 2);
-        // Compare streams only: CreationDate and the trailer ID vary over time.
+        // Compare streams only: CreationDate and the trailer ID vary over time, and so do
+        // the dates in the XMP stream, which is left out.
         let streams = |pdf: &[u8]| -> Vec<Vec<u8>> {
             let mut rest = pdf;
             let mut result = Vec::new();
             while let Some(start) = rest.windows(7).position(|w| w == b"stream\n") {
                 rest = &rest[start + 7..];
                 let end = rest.windows(9).position(|w| w == b"endstream").unwrap();
-                result.push(rest[..end].to_vec());
+                if !rest.starts_with(b"<?xpacket") {
+                    result.push(rest[..end].to_vec());
+                }
                 rest = &rest[end + 9..];
             }
             result
