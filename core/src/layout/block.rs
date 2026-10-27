@@ -103,6 +103,66 @@ pub struct LaidOutTable {
     pub caption: Option<Box<LaidOutBox>>,
     pub caption_side: CaptionSide,
     pub rows: Vec<LaidOutTableRow>,
+    /// The space the layout keeps below the last row (see [`CollapsedBoundary::gap`]).
+    pub trailing_gap: f32,
+}
+
+/// A page break between two rows of a table, as seen from one of its fragments.
+#[derive(Debug, Clone)]
+pub struct TableBreak {
+    /// The row across the break (its cells left out), whose collapsed borders meet those of
+    /// this fragment's row there.
+    pub row: Box<LaidOutTableRow>,
+    /// The part of the collapsed border at the break that this fragment draws (see
+    /// [`CollapsedBoundary::split_gaps`]).
+    pub share: f32,
+}
+
+/// The widths of the collapsed borders meeting at one boundary between table rows (or at the
+/// top or bottom of the table), kept per side so that a page break can split them. All are 0
+/// in the separate model.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CollapsedBoundary {
+    /// The widest bottom edge of the row above and, where its row group ends there, the group.
+    pub upper: f32,
+    /// The widest bottom border of the cells ending there.
+    pub upper_cells: f32,
+    /// The widest top edge of the row below and, where its row group starts there, the group.
+    pub lower: f32,
+    /// The widest top border of the cells starting there.
+    pub lower_cells: f32,
+}
+
+impl CollapsedBoundary {
+    /// The space the layout keeps between the rows. A browser gives a collapsed border its
+    /// width between the rows, but the cells' own borders already take theirs inside the
+    /// cells, so only what the row and group borders need beyond those is kept.
+    pub fn gap(&self) -> f32 {
+        (self.upper.max(self.lower) - self.upper_cells.max(self.lower_cells)).max(0.0)
+    }
+
+    /// The space kept at the end of the fragment above and at the start of the fragment below
+    /// when a page break falls here and the fragment above draws `share_above` of the border.
+    /// Chrome splits it in half, or, when the half above does not fit on its page, draws all
+    /// of it below.
+    pub fn split_gaps(&self, share_above: f32) -> (f32, f32) {
+        let width = self.upper.max(self.lower);
+        (
+            (width * share_above - self.upper_cells).max(0.0),
+            (width * (1.0 - share_above) - self.lower_cells).max(0.0),
+        )
+    }
+
+    /// The boundary with this one's upper side and `below`'s lower side, for rows that meet
+    /// only in a fragment (a repeated `<thead>` and the first row below it).
+    pub fn joined_with(&self, below: &CollapsedBoundary) -> CollapsedBoundary {
+        CollapsedBoundary {
+            upper: self.upper,
+            upper_cells: self.upper_cells,
+            lower: below.lower,
+            lower_cells: below.lower_cells,
+        }
+    }
 }
 
 /// One laid-out table row.
@@ -118,6 +178,19 @@ pub struct LaidOutTableRow {
     /// The row group element (`<thead>`/`<tbody>`/`<tfoot>`) the row sits in. `None` for a
     /// row placed directly in the table.
     pub group: Option<NodeId>,
+    /// Whether the row is the first or the last of its row group in the whole table (not just
+    /// in a fragment of it): a group's collapsed border is drawn only where the group really
+    /// starts or ends, never at a page break inside it.
+    pub first_in_group: bool,
+    pub last_in_group: bool,
+    /// The boundary above the row. The layout keeps [`CollapsedBoundary::gap`] there, and
+    /// `paginate` keeps the same, or splits it at a page break.
+    pub boundary_above: CollapsedBoundary,
+    /// On the first or the last row of a fragment of a table split across pages, the page
+    /// break above or below it. Kept on the rows rather than on [`LaidOutTable`], whose size
+    /// every [`LaidOutBox`] pays for through [`LaidOutContent`].
+    pub break_above: Option<TableBreak>,
+    pub break_below: Option<TableBreak>,
 }
 
 /// One absolutely positioned box.
@@ -850,6 +923,7 @@ fn layout_box_impl(
                 style.table_layout,
                 h_spacing,
                 v_spacing,
+                style.border_collapse == BorderCollapse::Collapse,
                 content_x,
                 content_y,
                 pos,

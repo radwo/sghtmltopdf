@@ -41,8 +41,8 @@ use crate::pdf::ImageAssetCache;
 
 use super::block::{
     layout_document, layout_document_positioned, shift_box_x, shift_box_y, shift_box_y_in_place,
-    FragmentationHints, LaidOutBox, LaidOutContent, LaidOutTable, LaidOutTableRow, PositionedBox,
-    PositionedKind,
+    CollapsedBoundary, FragmentationHints, LaidOutBox, LaidOutContent, LaidOutTable,
+    LaidOutTableRow, PositionedBox, PositionedKind, TableBreak,
 };
 use super::box_tree::TableSection;
 use super::box_tree::{build_box_tree, resolve_images};
@@ -1501,7 +1501,10 @@ fn place_table(
         .filter(|row| row.section == TableSection::Head)
         .cloned()
         .collect();
-    let head_top = head_rows.iter().map(table_row_top).fold(f32::MAX, f32::min);
+    let head_top = head_rows
+        .iter()
+        .map(|row| table_row_top(row) - row.boundary_above.gap())
+        .fold(f32::MAX, f32::min);
     let head_bottom = head_rows
         .iter()
         .map(table_row_bottom)
@@ -1511,6 +1514,18 @@ fn place_table(
     } else {
         head_bottom - head_top
     };
+    // The boundary below the head's last row, whose upper side a repeated head brings along.
+    let head_boundary_below = table
+        .rows
+        .iter()
+        .position(|row| row.section != TableSection::Head)
+        .map_or(CollapsedBoundary::default(), |i| {
+            table.rows[i].boundary_above
+        });
+    let row_count = table.rows.len();
+    // The row placed last (its cells left out), to hand to the fragment that follows a break.
+    let mut previous_row: Option<LaidOutTableRow> = None;
+
     let repeat_head = !head_rows.is_empty() && head_height < page_height;
     // A `caption-side: top` caption goes on the first fragment.
     let caption_is_top = table.caption_side == CaptionSide::Top;
@@ -1534,11 +1549,20 @@ fn place_table(
 
     for (index, mut row) in std::mem::take(&mut table.rows).into_iter().enumerate() {
         let row_top = table_row_top(&row);
-        let row_bottom = table_row_bottom(&row);
+        let cells_bottom = table_row_bottom(&row);
+        // The last row needs room for the table's closing collapsed border too. Other rows
+        // need none: at a break after them the border can move to the next page whole.
+        let row_bottom = cells_bottom
+            + if index + 1 == row_count {
+                table.trailing_gap
+            } else {
+                0.0
+            };
         let extra_above = if index == 0 { caption_height } else { 0.0 };
 
         if pending.is_empty() {
-            let (top, s) = start_new_fragment(cursor, row_top, extra_above);
+            let gap_above = row.boundary_above.gap();
+            let (top, s) = start_new_fragment(cursor, row_top - gap_above, extra_above);
             fragment_top = top;
             shift = s;
 
@@ -1551,7 +1575,7 @@ fn place_table(
                 if is_first_fragment {
                     *cursor += top_extra;
                 }
-                let (top, s) = start_new_fragment(cursor, row_top, extra_above);
+                let (top, s) = start_new_fragment(cursor, row_top - gap_above, extra_above);
                 fragment_top = top;
                 shift = s;
             }
@@ -1563,6 +1587,20 @@ fn place_table(
         // content at the top of a page, and never creating an empty fragment guarantees progress.
         let row_bottom_on_page = row_bottom - shift;
         if row_bottom_on_page > page_height && !pending.is_empty() {
+            let boundary = &row.boundary_above;
+            let share_above = if *cursor + boundary.split_gaps(0.5).0 <= page_height {
+                0.5
+            } else {
+                0.0
+            };
+            let (end_gap, start_gap) = boundary.split_gaps(share_above);
+            *cursor += end_gap;
+            if let Some(last) = pending.last_mut() {
+                last.break_below = Some(TableBreak {
+                    row: Box::new(without_cells(&row)),
+                    share: share_above,
+                });
+            }
             flush_table_fragment(
                 container,
                 &mut pending,
@@ -1578,20 +1616,30 @@ fn place_table(
             fragment_top = *cursor;
             // Copy the heading rows to the top of the new page (the original rows are placed
             // on the first page as-is, so copies only appear from the second page on).
-            if repeat_head {
+            // Below a repeated head the row meets the head rather than the break, as in Chrome.
+            let gap_above = if repeat_head {
                 let head_shift = head_top - *cursor;
                 for head_row in &head_rows {
                     pending.push(shift_table_row_y(head_row, head_shift));
                 }
                 *cursor += head_height;
-            }
-            shift = row_top - *cursor;
+                head_boundary_below.joined_with(&row.boundary_above).gap()
+            } else {
+                row.break_above = previous_row.take().map(|previous| TableBreak {
+                    row: Box::new(previous),
+                    share: 1.0 - share_above,
+                });
+                start_gap
+            };
+            shift = row_top - gap_above - *cursor;
         }
 
+        previous_row = Some(without_cells(&row));
         shift_table_row_y_in_place(&mut row, shift);
         pending.push(row);
-        *cursor = row_bottom - shift;
+        *cursor = cells_bottom - shift;
     }
+    *cursor += table.trailing_gap;
 
     // A `caption-side: bottom` caption goes on the last fragment.
     if !caption_is_top {
@@ -1613,6 +1661,21 @@ fn place_table(
         state,
     );
     *cursor += bottom_extra;
+}
+
+/// A copy of `row` without its cells, for a fragment to know the row across a break.
+fn without_cells(row: &LaidOutTableRow) -> LaidOutTableRow {
+    LaidOutTableRow {
+        node: row.node,
+        cells: Vec::new(),
+        section: row.section,
+        group: row.group,
+        first_in_group: row.first_in_group,
+        last_in_group: row.last_in_group,
+        boundary_above: row.boundary_above,
+        break_above: None,
+        break_below: None,
+    }
 }
 
 /// Push the rows `place_table` assembled onto the page as one fragment.
@@ -1652,6 +1715,7 @@ fn flush_table_fragment(
             caption: caption.take().map(Box::new),
             caption_side: CaptionSide::Top,
             rows: std::mem::take(rows),
+            trailing_gap: 0.0,
         }),
         marker: None,
         link: container.link.clone(),
@@ -1689,6 +1753,11 @@ fn shift_table_row_y(row: &LaidOutTableRow, shift: f32) -> LaidOutTableRow {
         cells: row.cells.iter().map(|c| shift_box_y(c, shift)).collect(),
         section: row.section,
         group: row.group,
+        first_in_group: row.first_in_group,
+        last_in_group: row.last_in_group,
+        boundary_above: row.boundary_above,
+        break_above: None,
+        break_below: None,
     }
 }
 

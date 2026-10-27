@@ -51,7 +51,8 @@ use crate::html::NodeId;
 use crate::img::resolve_against_base_href;
 use crate::layout::{
     resolve_border, shape_standalone_line, EdgeSizes, EmphasisMark, FragmentPosition, LaidOutBox,
-    LaidOutContent, LaidOutTableRow, Layout, LineBox, Page, PageSettings, Rect, TextRun,
+    LaidOutContent, LaidOutTable, LaidOutTableRow, Layout, LineBox, Page, PageSettings, Rect,
+    TextRun,
 };
 use crate::sink::Sink;
 use crate::style::{
@@ -1643,6 +1644,13 @@ fn render_box_with_style_inner(
             } else {
                 Vec::new()
             };
+            // Row and row-group borders are drawn only in the collapsing model (CSS2.1
+            // 17.6.1: in the separate model rows and row groups cannot have borders).
+            let collapse_rows = if collapse {
+                CollapsedRows::new(table, &all_cells, styles)
+            } else {
+                CollapsedRows::default()
+            };
             // Row groups are the layer below rows and cells (CSS2.1 17.5.1), so every group is
             // painted before the first row.
             render_row_group_backgrounds(content, &table.rows, styles, settings, alpha_gs_names);
@@ -1661,8 +1669,13 @@ fn render_box_with_style_inner(
                         continue;
                     }
                     if collapse {
-                        let (resolved_style, resolved_border) =
-                            resolve_collapsed_cell_style(cell, &cell_style, &all_cells, styles);
+                        let (resolved_style, resolved_border) = resolve_collapsed_cell_style(
+                            cell,
+                            &cell_style,
+                            &all_cells,
+                            &collapse_rows,
+                            styles,
+                        );
                         // The drawn border thickness comes from `layout.border` (computed
                         // when layout settled) rather than `ComputedStyle`
                         // (see [`render_border`]), so a clone reflecting the merged
@@ -1699,6 +1712,9 @@ fn render_box_with_style_inner(
                         );
                     }
                 }
+            }
+            if collapse {
+                render_collapsed_row_gaps(content, &collapse_rows, &all_cells, styles, settings);
             }
         }
     }
@@ -1786,17 +1802,16 @@ fn resolve_collapsed_cell_style(
     cell: &LaidOutBox,
     cell_style: &ComputedStyle,
     all_cells: &[&LaidOutBox],
+    rows: &CollapsedRows<'_>,
     styles: &HashMap<NodeId, Rc<ComputedStyle>>,
 ) -> (ComputedStyle, EdgeSizes) {
-    // The tolerance allowed when deciding whether rectangles touch (guarding against floating-point rounding).
-    const EPSILON: f32 = 0.5;
-
-    fn ranges_overlap(a_start: f32, a_end: f32, b_start: f32, b_end: f32) -> bool {
-        a_start < b_end - EPSILON && b_start < a_end - EPSILON
-    }
+    const EPSILON: f32 = COLLAPSE_EPSILON;
+    let ranges_overlap = collapse_ranges_overlap;
 
     let rect = cell.layout.border_box();
     let mut resolved = cell_style.clone();
+    let start_row = rows.row_starting_at(rect.y);
+    let end_row = rows.row_ending_at(rect.y + rect.height);
 
     let has_left_neighbor = all_cells.iter().any(|other| {
         let o = other.layout.border_box();
@@ -1806,6 +1821,14 @@ fn resolve_collapsed_cell_style(
     if has_left_neighbor {
         resolved.border_left_style = BorderStyle::None;
         resolved.border_left_width = Length(0.0);
+    } else if let Some(i) = start_row.filter(|_| (rect.x - rows.left).abs() < EPSILON) {
+        let own = border_edge(
+            cell_style.border_left_width.0,
+            cell_style.border_left_style,
+            cell_style.border_left_color,
+        );
+        let edges = std::iter::once(own).chain(rows.side_edges(i, Side::Left));
+        set_left_edge(&mut resolved, merge_border_edges(edges));
     }
 
     let has_top_neighbor = all_cells.iter().any(|other| {
@@ -1813,9 +1836,22 @@ fn resolve_collapsed_cell_style(
         (o.y + o.height - rect.y).abs() < EPSILON
             && ranges_overlap(rect.x, rect.x + rect.width, o.x, o.x + o.width)
     });
-    if has_top_neighbor {
+    // With a row above, the boundary belongs to the side above: either the cell there (which
+    // merges in this cell's top) or, where the row above has no cell, that row's own segment
+    // (see [`render_collapsed_row_gaps`]).
+    if has_top_neighbor || start_row.is_some_and(|i| i > 0) {
         resolved.border_top_style = BorderStyle::None;
         resolved.border_top_width = Length(0.0);
+    } else if start_row.is_some() {
+        let own = border_edge(
+            cell_style.border_top_width.0,
+            cell_style.border_top_style,
+            cell_style.border_top_color,
+        );
+        set_top_edge(
+            &mut resolved,
+            merge_border_edges([own, rows.first_top_edge()]),
+        );
     }
 
     if let Some(right_neighbor) = all_cells.iter().find(|other| {
@@ -1842,33 +1878,63 @@ fn resolve_collapsed_cell_style(
         resolved.border_right_width = Length(width);
         resolved.border_right_style = style;
         resolved.border_right_color = color;
+    } else if let Some(i) = start_row.filter(|_| (rect.x + rect.width - rows.right).abs() < EPSILON)
+    {
+        let own = border_edge(
+            cell_style.border_right_width.0,
+            cell_style.border_right_style,
+            cell_style.border_right_color,
+        );
+        let edges = std::iter::once(own).chain(rows.side_edges(i, Side::Right));
+        let (width, style, color) = merge_border_edges(edges);
+        resolved.border_right_width = Length(width);
+        resolved.border_right_style = style;
+        resolved.border_right_color = color;
     }
 
-    if let Some(bottom_neighbor) = all_cells.iter().find(|other| {
+    let own_bottom = border_edge(
+        cell_style.border_bottom_width.0,
+        cell_style.border_bottom_style,
+        cell_style.border_bottom_color,
+    );
+    let upper: Vec<BorderEdge> = match end_row {
+        Some(i) if i + 1 == rows.rows.len() => vec![own_bottom, rows.last_bottom_edge()],
+        Some(i) => std::iter::once(own_bottom)
+            .chain(rows.bottom_edges(i))
+            .collect(),
+        None => vec![own_bottom],
+    };
+    let bottom_neighbor = all_cells.iter().find(|other| {
         let o = other.layout.border_box();
         (o.y - (rect.y + rect.height)).abs() < EPSILON
             && ranges_overlap(rect.x, rect.x + rect.width, o.x, o.x + o.width)
-    }) {
+    });
+    let lower: Vec<BorderEdge> = if let Some(bottom_neighbor) = bottom_neighbor {
         let neighbor_style = bottom_neighbor
             .node
             .and_then(|n| styles.get(&n))
             .cloned()
             .unwrap_or_default();
-        let own = border_edge(
-            cell_style.border_bottom_width.0,
-            cell_style.border_bottom_style,
-            cell_style.border_bottom_color,
-        );
         let theirs = border_edge(
             neighbor_style.border_top_width.0,
             neighbor_style.border_top_style,
             neighbor_style.border_top_color,
         );
-        let (width, style, color) = resolve_border_conflict(own, theirs);
-        resolved.border_bottom_width = Length(width);
-        resolved.border_bottom_style = style;
-        resolved.border_bottom_color = color;
-    }
+        let below = rows.row_starting_at(bottom_neighbor.layout.border_box().y);
+        std::iter::once(theirs)
+            .chain(below.into_iter().flat_map(|i| rows.top_edges(i)))
+            .collect()
+    } else {
+        end_row
+            .map(|i| i + 1)
+            .filter(|&i| i < rows.rows.len())
+            .map(|i| rows.top_edges(i).collect())
+            .unwrap_or_default()
+    };
+    let (width, style, color) = merge_border_edges(upper.into_iter().chain(lower));
+    resolved.border_bottom_width = Length(width);
+    resolved.border_bottom_style = style;
+    resolved.border_bottom_color = color;
 
     let border = resolve_border(&resolved);
     (resolved, border)
@@ -1883,6 +1949,412 @@ fn border_edge(width: f32, style: BorderStyle, color: RgbaColor) -> (f32, Border
     } else {
         (width, style, color)
     }
+}
+
+/// The tolerance allowed when deciding whether collapsed table rectangles touch (guarding
+/// against floating-point rounding).
+const COLLAPSE_EPSILON: f32 = 0.5;
+
+fn collapse_ranges_overlap(a_start: f32, a_end: f32, b_start: f32, b_end: f32) -> bool {
+    a_start < b_end - COLLAPSE_EPSILON && b_start < a_end - COLLAPSE_EPSILON
+}
+
+/// One border edge as `(effective width, style, colour)` (see [`border_edge`]).
+type BorderEdge = (f32, BorderStyle, RgbaColor);
+
+#[derive(Debug, Clone, Copy)]
+enum Side {
+    Left,
+    Right,
+}
+
+/// Merge every edge meeting at one boundary with [`resolve_border_conflict`]. On a full tie
+/// the earlier edge wins, so callers list the cell's own edge before its row's and the row's
+/// before its row group's (CSS2.1 17.6.2.1, rule 4).
+fn merge_border_edges(edges: impl IntoIterator<Item = BorderEdge>) -> BorderEdge {
+    edges
+        .into_iter()
+        .reduce(resolve_border_conflict)
+        .unwrap_or((
+            0.0,
+            BorderStyle::None,
+            RgbaColor {
+                red: 0,
+                green: 0,
+                blue: 0,
+                alpha: 0.0,
+            },
+        ))
+}
+
+fn set_left_edge(style: &mut ComputedStyle, (width, border_style, color): BorderEdge) {
+    style.border_left_width = Length(width);
+    style.border_left_style = border_style;
+    style.border_left_color = color;
+}
+
+fn set_top_edge(style: &mut ComputedStyle, (width, border_style, color): BorderEdge) {
+    style.border_top_width = Length(width);
+    style.border_top_style = border_style;
+    style.border_top_color = color;
+}
+
+/// One table row's band, with the styles of the row and of its row group, for merging row
+/// and row-group borders into the collapsed cell borders.
+///
+/// `LaidOutTableRow` carries no geometry, so a row's band runs from the top of its cells to
+/// the top of the next row (the bottom of its tallest cell for the last row); `cells_bottom`
+/// is where its cells end, above the space the layout keeps for the borders below the row. A
+/// row that holds no cell of its own (every column taken by a `rowspan` from above) has no
+/// band and takes no part.
+#[derive(Debug)]
+struct CollapsedRow<'a> {
+    top: f32,
+    bottom: f32,
+    cells_bottom: f32,
+    row: Option<&'a ComputedStyle>,
+    group: Option<&'a ComputedStyle>,
+    first_in_group: bool,
+    last_in_group: bool,
+}
+
+/// One row's top or bottom edges and, where its group starts or ends there, the group's.
+fn row_edges<'a>(
+    row: &LaidOutTableRow,
+    styles: &'a HashMap<NodeId, Rc<ComputedStyle>>,
+    top: bool,
+) -> impl Iterator<Item = BorderEdge> + 'a {
+    let style_of = |node: Option<NodeId>| node.and_then(|n| styles.get(&n)).map(Rc::as_ref);
+    let group_ends = if top {
+        row.first_in_group
+    } else {
+        row.last_in_group
+    };
+    let edge = move |s: &ComputedStyle| {
+        if top {
+            border_edge(s.border_top_width.0, s.border_top_style, s.border_top_color)
+        } else {
+            border_edge(
+                s.border_bottom_width.0,
+                s.border_bottom_style,
+                s.border_bottom_color,
+            )
+        }
+    };
+    style_of(row.node)
+        .map(edge)
+        .into_iter()
+        .chain(style_of(row.group).filter(|_| group_ends).map(edge))
+}
+
+/// `edge` with its width scaled by `share`, for a collapsed border split by a page break.
+fn scale_edge((width, style, color): BorderEdge, share: f32) -> BorderEdge {
+    (width * share, style, color)
+}
+
+/// The rows of one table (or of the part of it placed on a page) under
+/// `border-collapse: collapse`, spanning `left..right` (the outer edges of the cells).
+#[derive(Debug, Default)]
+struct CollapsedRows<'a> {
+    rows: Vec<CollapsedRow<'a>>,
+    left: f32,
+    right: f32,
+    /// At a page break above the first row or below the last, the edges of the row across it
+    /// and the part of the border there that this fragment draws (see [`crate::layout::TableBreak`]).
+    across_above: Option<(Vec<BorderEdge>, f32)>,
+    across_below: Option<(Vec<BorderEdge>, f32)>,
+}
+
+impl<'a> CollapsedRows<'a> {
+    fn new(
+        table: &LaidOutTable,
+        all_cells: &[&LaidOutBox],
+        styles: &'a HashMap<NodeId, Rc<ComputedStyle>>,
+    ) -> Self {
+        let rows = &table.rows;
+        let style_of = |node: Option<NodeId>| node.and_then(|n| styles.get(&n)).map(Rc::as_ref);
+        let mut bands: Vec<CollapsedRow<'a>> = Vec::new();
+        for row in rows {
+            let Some(top) = row
+                .cells
+                .iter()
+                .map(|c| c.layout.border_box().y)
+                .reduce(f32::min)
+            else {
+                continue;
+            };
+            let cell_bottoms = row
+                .cells
+                .iter()
+                .map(|c| c.layout.border_box().y + c.layout.border_box().height);
+            // A cell spanning rows below ends lower than the row; the others end with it.
+            let cells_bottom = cell_bottoms.clone().fold(f32::MAX, f32::min);
+            let bottom = cell_bottoms.fold(top, f32::max);
+            bands.push(CollapsedRow {
+                top,
+                bottom,
+                cells_bottom,
+                row: style_of(row.node),
+                group: style_of(row.group),
+                first_in_group: row.first_in_group,
+                last_in_group: row.last_in_group,
+            });
+        }
+        for i in 1..bands.len() {
+            let next_top = bands[i].top;
+            bands[i - 1].bottom = next_top;
+        }
+        let left = all_cells
+            .iter()
+            .map(|c| c.layout.border_box().x)
+            .fold(f32::MAX, f32::min);
+        let right = all_cells
+            .iter()
+            .map(|c| c.layout.border_box().x + c.layout.border_box().width)
+            .fold(f32::MIN, f32::max);
+        Self {
+            rows: bands,
+            left,
+            right,
+            across_above: rows
+                .first()
+                .and_then(|r| r.break_above.as_ref())
+                .map(|b| (row_edges(&b.row, styles, false).collect(), b.share)),
+            across_below: rows
+                .last()
+                .and_then(|r| r.break_below.as_ref())
+                .map(|b| (row_edges(&b.row, styles, true).collect(), b.share)),
+        }
+    }
+
+    /// The row and group edges along the top of the first row. Below a page break, Chrome
+    /// draws the border of the boundary there split between the two pages, so the edges of
+    /// the row above the break are merged in and this page's share of the width is drawn.
+    fn first_top_edge(&self) -> BorderEdge {
+        let own = self.top_edges(0);
+        match &self.across_above {
+            Some((across, share)) => scale_edge(
+                merge_border_edges(across.iter().copied().chain(own)),
+                *share,
+            ),
+            None => merge_border_edges(own),
+        }
+    }
+
+    /// The row and group edges along the bottom of the last row, split above a page break
+    /// (see [`Self::first_top_edge`]).
+    fn last_bottom_edge(&self) -> BorderEdge {
+        let own = self.bottom_edges(self.rows.len() - 1);
+        match &self.across_below {
+            Some((across, share)) => scale_edge(
+                merge_border_edges(own.chain(across.iter().copied())),
+                *share,
+            ),
+            None => merge_border_edges(own),
+        }
+    }
+
+    fn row_starting_at(&self, y: f32) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|r| (r.top - y).abs() < COLLAPSE_EPSILON)
+    }
+
+    fn row_ending_at(&self, y: f32) -> Option<usize> {
+        self.rows
+            .iter()
+            .position(|r| (r.cells_bottom - y).abs() < COLLAPSE_EPSILON)
+    }
+
+    /// The top edges of row `i` and, for the first row of a group, of the group.
+    fn top_edges(&self, i: usize) -> impl Iterator<Item = BorderEdge> + '_ {
+        let r = &self.rows[i];
+        let edge = |s: &ComputedStyle| {
+            border_edge(s.border_top_width.0, s.border_top_style, s.border_top_color)
+        };
+        r.row
+            .map(edge)
+            .into_iter()
+            .chain(r.group.filter(|_| r.first_in_group).map(edge))
+    }
+
+    /// The bottom edges of row `i` and, for the last row of a group, of the group.
+    fn bottom_edges(&self, i: usize) -> impl Iterator<Item = BorderEdge> + '_ {
+        let r = &self.rows[i];
+        let edge = |s: &ComputedStyle| {
+            border_edge(
+                s.border_bottom_width.0,
+                s.border_bottom_style,
+                s.border_bottom_color,
+            )
+        };
+        r.row
+            .map(edge)
+            .into_iter()
+            .chain(r.group.filter(|_| r.last_in_group).map(edge))
+    }
+
+    /// The left or right edges of row `i` and of its group.
+    fn side_edges(&self, i: usize, side: Side) -> impl Iterator<Item = BorderEdge> + '_ {
+        let r = &self.rows[i];
+        let edge = move |s: &ComputedStyle| match side {
+            Side::Left => border_edge(
+                s.border_left_width.0,
+                s.border_left_style,
+                s.border_left_color,
+            ),
+            Side::Right => border_edge(
+                s.border_right_width.0,
+                s.border_right_style,
+                s.border_right_color,
+            ),
+        };
+        r.row.map(edge).into_iter().chain(r.group.map(edge))
+    }
+}
+
+/// The parts of `left..right` that no rectangle in `covers` (given as x ranges) reaches.
+fn uncovered_ranges(left: f32, right: f32, mut covers: Vec<(f32, f32)>) -> Vec<(f32, f32)> {
+    covers.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut gaps = Vec::new();
+    let mut x = left;
+    for (start, end) in covers {
+        if start > x + COLLAPSE_EPSILON {
+            gaps.push((x, start.min(right)));
+        }
+        x = x.max(end);
+    }
+    if right > x + COLLAPSE_EPSILON {
+        gaps.push((x, right));
+    }
+    gaps
+}
+
+/// Draw the row and row-group borders across the parts of a row that hold no cell, under
+/// `border-collapse: collapse`. A row with fewer cells than the table has columns still
+/// spans the whole table width, so its (and its group's) top and bottom borders run past the
+/// last cell, as in browsers. Where a cell does sit, its own merged border carries the row's
+/// and group's edges instead (see [`resolve_collapsed_cell_style`]).
+///
+/// The same direction rule as the cells keeps each boundary drawn once: a segment draws the
+/// bottom boundary merged with what lies below (a cell's top, the next row's and group's top),
+/// and draws its top boundary only for the first row.
+fn render_collapsed_row_gaps(
+    content: &mut RenderTarget<'_>,
+    rows: &CollapsedRows<'_>,
+    all_cells: &[&LaidOutBox],
+    styles: &HashMap<NodeId, Rc<ComputedStyle>>,
+    settings: &PageSettings,
+) {
+    let cells_in_band = |top: f32, bottom: f32| -> Vec<(f32, f32)> {
+        all_cells
+            .iter()
+            .map(|c| c.layout.border_box())
+            .filter(|b| collapse_ranges_overlap(top, bottom, b.y, b.y + b.height))
+            .map(|b| (b.x, b.x + b.width))
+            .collect()
+    };
+    for (i, row) in rows.rows.iter().enumerate() {
+        for (x0, x1) in uncovered_ranges(rows.left, rows.right, cells_in_band(row.top, row.bottom))
+        {
+            if i == 0 {
+                let edge = rows.first_top_edge();
+                draw_horizontal_edge(
+                    content,
+                    settings,
+                    x0,
+                    x1,
+                    row.top,
+                    edge,
+                    BorderSideKind::Top,
+                );
+            }
+            let upper: Vec<BorderEdge> = rows.bottom_edges(i).collect();
+            let Some(next) = rows.rows.get(i + 1) else {
+                let edge = rows.last_bottom_edge();
+                draw_horizontal_edge(
+                    content,
+                    settings,
+                    x0,
+                    x1,
+                    row.cells_bottom,
+                    edge,
+                    BorderSideKind::Bottom,
+                );
+                continue;
+            };
+            // Split the segment where cells of the next row begin, so each piece merges with
+            // the cell below it.
+            let lower_row: Vec<BorderEdge> = rows.top_edges(i + 1).collect();
+            let below: Vec<(f32, f32, BorderEdge)> = all_cells
+                .iter()
+                .filter(|c| (c.layout.border_box().y - next.top).abs() < COLLAPSE_EPSILON)
+                .filter_map(|c| {
+                    let b = c.layout.border_box();
+                    let (a, e) = (b.x.max(x0), (b.x + b.width).min(x1));
+                    let s = c.node.and_then(|n| styles.get(&n))?;
+                    let top =
+                        border_edge(s.border_top_width.0, s.border_top_style, s.border_top_color);
+                    (e - a > COLLAPSE_EPSILON).then_some((a, e, top))
+                })
+                .collect();
+            let mut pieces: Vec<(f32, f32, Option<BorderEdge>)> =
+                below.iter().map(|&(a, e, top)| (a, e, Some(top))).collect();
+            let covered = below.iter().map(|&(a, e, _)| (a, e)).collect();
+            pieces.extend(
+                uncovered_ranges(x0, x1, covered)
+                    .into_iter()
+                    .map(|(a, e)| (a, e, None)),
+            );
+            for (a, e, cell_top) in pieces {
+                // The edges above come first and so win a full tie, as at a boundary between
+                // two cells.
+                let edges = upper
+                    .iter()
+                    .copied()
+                    .chain(cell_top)
+                    .chain(lower_row.iter().copied());
+                let edge = merge_border_edges(edges);
+                draw_horizontal_edge(
+                    content,
+                    settings,
+                    a,
+                    e,
+                    row.cells_bottom,
+                    edge,
+                    BorderSideKind::Bottom,
+                );
+            }
+        }
+    }
+}
+
+/// Draw one horizontal border band between `x0` and `x1` on the outer side of the edge at
+/// `y`: above it for the top edge of a row ([`BorderSideKind::Top`]), below it for the bottom
+/// edge ([`BorderSideKind::Bottom`]).
+///
+/// That is where a collapsed cell with no border of its own draws a border it takes over from
+/// a neighbour, row or group (its border box grows outwards by the merged width), so a
+/// segment lines up with the cells beside it.
+fn draw_horizontal_edge(
+    content: &mut RenderTarget<'_>,
+    settings: &PageSettings,
+    x0: f32,
+    x1: f32,
+    y: f32,
+    (width, border_style, color): BorderEdge,
+    side: BorderSideKind,
+) {
+    let x0 = settings.margin.left + x0;
+    let x1 = settings.margin.left + x1;
+    let y = to_pdf_y(settings, y);
+    let corners = match side {
+        BorderSideKind::Top => {
+            BorderSideCorners::new((x0, y + width), (x1, y + width), (x1, y), (x0, y))
+        }
+        _ => BorderSideCorners::new((x1, y - width), (x0, y - width), (x0, y), (x1, y)),
+    };
+    render_border_side(content, side, border_style, color, width, corners);
 }
 
 /// A simplified version of CSS2.1 section 17.6.2's border conflict resolution: the thicker
@@ -5597,6 +6069,220 @@ mod tests {
             out.push((i, rects));
         }
         out
+    }
+
+    /// The vertices of every filled polygon (border sides are `m`/`l` paths) whose colour is
+    /// set by `rg_line`, one `Vec` per polygon, in stream order.
+    fn polygon_fills_of(text: &str, rg_line: &str) -> Vec<Vec<(f32, f32)>> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut out = Vec::new();
+        for (i, _) in lines.iter().enumerate().filter(|(_, l)| **l == rg_line) {
+            let mut points = Vec::new();
+            for line in &lines[i + 1..] {
+                if let Some(args) = line.strip_suffix(" m").or_else(|| line.strip_suffix(" l")) {
+                    let v: Vec<f32> = args.split(' ').map(|n| n.parse().unwrap()).collect();
+                    points.push((v[0], v[1]));
+                } else if *line == "f" {
+                    break;
+                }
+            }
+            if !points.is_empty() {
+                out.push(points);
+            }
+        }
+        out
+    }
+
+    /// The horizontal extent (`min x`, `max x`) and the height of the union of polygons.
+    fn polygons_extent(polygons: &[Vec<(f32, f32)>]) -> (f32, f32, f32) {
+        let points = polygons.iter().flatten();
+        let xs = points.clone().map(|p| p.0);
+        let ys = points.map(|p| p.1);
+        let min_x = xs.clone().fold(f32::MAX, f32::min);
+        let max_x = xs.fold(f32::MIN, f32::max);
+        let min_y = ys.clone().fold(f32::MAX, f32::min);
+        let max_y = ys.fold(f32::MIN, f32::max);
+        (min_x, max_x, max_y - min_y)
+    }
+
+    /// The `(bottom, top)` of every red polygon on each page, in PDF coordinates.
+    fn red_bands_per_page(html_src: &str, css: &str) -> Vec<Vec<(f32, f32)>> {
+        page_streams(html_src, css)
+            .iter()
+            .map(|stream| {
+                polygon_fills_of(stream, "1 0 0 rg")
+                    .iter()
+                    .map(|points| {
+                        let ys = points.iter().map(|p| p.1);
+                        (
+                            ys.clone().fold(f32::MAX, f32::min),
+                            ys.fold(f32::MIN, f32::max),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn one_column_rows(row_count: usize) -> String {
+        (0..row_count)
+            .map(|i| format!("<tr><td>{i}</td></tr>"))
+            .collect()
+    }
+
+    const SPLIT_CSS: &str = "body { margin: 0 } table { border-collapse: collapse } \
+                             td, th { height: 20px; padding: 0 }";
+
+    #[test]
+    fn a_collapsed_row_border_at_a_page_break_is_drawn_half_on_each_page() {
+        let html_src = format!("<table>{}</table>", one_column_rows(80));
+        let css = format!("{SPLIT_CSS} tr {{ border-bottom: 8px solid rgb(255, 0, 0) }}");
+        let pages = red_bands_per_page(&html_src, &css);
+        let settings = PageSettings::default();
+        let content_top = settings.size.height - settings.margin.top;
+        let last_on_first = pages[0].iter().min_by(|a, b| a.0.total_cmp(&b.0)).unwrap();
+        assert!(
+            (last_on_first.1 - last_on_first.0 - 4.0).abs() < 0.01,
+            "{last_on_first:?}"
+        );
+        let first_on_second = pages[1].iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+        assert!(
+            (first_on_second.1 - content_top).abs() < 0.01
+                && (first_on_second.1 - first_on_second.0 - 4.0).abs() < 0.01,
+            "{first_on_second:?}"
+        );
+    }
+
+    #[test]
+    fn no_collapsed_border_at_a_page_break_reaches_below_the_content_area() {
+        let settings = PageSettings::default();
+        let (bottom, top) = (
+            settings.margin.bottom,
+            settings.size.height - settings.margin.top,
+        );
+        let rows = one_column_rows(80);
+        let cases = (1..=12).flat_map(|w| {
+            [
+                (
+                    format!("<table>{rows}</table>"),
+                    format!("tr {{ border-bottom: {w}px solid rgb(255, 0, 0) }}"),
+                ),
+                (
+                    format!("<table>{rows}</table>"),
+                    format!("tr {{ border-top: {w}px solid rgb(255, 0, 0) }}"),
+                ),
+                (
+                    format!(
+                        "<table><thead><tr><th>No</th></tr></thead><tbody>{rows}</tbody></table>"
+                    ),
+                    format!("tbody {{ border-bottom: {w}px solid rgb(255, 0, 0) }}"),
+                ),
+            ]
+        });
+        for (html_src, border) in cases {
+            let pages = red_bands_per_page(&html_src, &format!("{SPLIT_CSS} {border}"));
+            assert!(pages.len() >= 2, "{border}");
+            for (i, bands) in pages.iter().enumerate() {
+                for &(b, t) in bands {
+                    assert!(
+                        b >= bottom - 0.01 && t <= top + 0.01,
+                        "{border}: page {i} draws {b}..{t} outside {bottom}..{top}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_group_border_is_drawn_only_where_the_group_ends() {
+        let html_src = format!(
+            "<table><thead><tr><th>No</th></tr></thead><tbody>{}</tbody></table>",
+            one_column_rows(80)
+        );
+        let css = format!("{SPLIT_CSS} tbody {{ border-bottom: 6px solid rgb(255, 0, 0) }}");
+        let pages = red_bands_per_page(&html_src, &css);
+        let (last, before) = pages.split_last().unwrap();
+        assert!(before.iter().all(Vec::is_empty), "{pages:?}");
+        assert_eq!(last.len(), 1, "{pages:?}");
+        assert!((last[0].1 - last[0].0 - 6.0).abs() < 0.01, "{pages:?}");
+    }
+
+    #[test]
+    fn below_a_repeated_head_the_row_border_is_drawn_whole() {
+        let html_src = format!(
+            "<table><thead><tr><th>No</th></tr></thead><tbody>{}</tbody></table>",
+            one_column_rows(80)
+        );
+        let css = format!("{SPLIT_CSS} tr {{ border-bottom: 8px solid rgb(255, 0, 0) }}");
+        let pages = red_bands_per_page(&html_src, &css);
+        let below_head = pages[1].iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+        assert!(
+            (below_head.1 - below_head.0 - 8.0).abs() < 0.01,
+            "{below_head:?}"
+        );
+    }
+
+    #[test]
+    fn collapsed_row_border_runs_across_the_row() {
+        let html_src = r#"<table>
+            <tr class="b"><td>a</td><td>b</td></tr>
+            <tr><td>c</td><td>d</td></tr>
+        </table>"#;
+        let css = "table { border-collapse: collapse; width: 200px } \
+                   tr.b { border-bottom: 4px solid rgb(255, 0, 0) }";
+        let streams = page_streams(html_src, css);
+        let red = polygon_fills_of(&streams[0], "1 0 0 rg");
+        let (left, right, height) = polygons_extent(&red);
+        assert!((right - left - 200.0).abs() < 0.5, "{red:?}");
+        assert!((height - 4.0).abs() < 0.01, "{red:?}");
+    }
+
+    #[test]
+    fn row_border_is_ignored_in_the_separate_model() {
+        // CSS2.1 17.6.1: in the separated borders model rows and row groups cannot have borders.
+        let html_src = r#"<table><tbody><tr><td>a</td><td>b</td></tr></tbody></table>"#;
+        let css = "tr, tbody { border-bottom: 4px solid rgb(255, 0, 0) }";
+        let streams = page_streams(html_src, css);
+        assert!(polygon_fills_of(&streams[0], "1 0 0 rg").is_empty());
+    }
+
+    #[test]
+    fn collapsed_row_group_border_spans_the_table_past_a_row_with_fewer_cells() {
+        // The last row of the group holds one cell spanning 2 of 4 columns. The group's
+        // bottom border still runs to the table's right edge, as in browsers.
+        let html_src = r#"<table>
+            <tbody><tr><td>1</td><td>2</td><td>3</td><td>4</td></tr></tbody>
+            <tbody class="sub">
+                <tr><td colspan="2">sub</td><td>9</td></tr>
+                <tr><td colspan="2">disc</td></tr>
+            </tbody>
+            <tbody><tr><td colspan="2">total</td><td>0</td><td>x</td></tr></tbody>
+        </table>"#;
+        let css = "table { border-collapse: collapse; width: 300px } \
+                   tbody.sub { border-bottom: 2px solid rgb(255, 0, 0) }";
+        let streams = page_streams(html_src, css);
+        let red = polygon_fills_of(&streams[0], "1 0 0 rg");
+        let (left, right, height) = polygons_extent(&red);
+        assert!((right - left - 300.0).abs() < 0.5, "{red:?}");
+        assert!(
+            (height - 2.0).abs() < 0.01,
+            "one band, not one per row: {red:?}"
+        );
+    }
+
+    #[test]
+    fn collapsed_cell_border_wider_than_its_row_border_wins() {
+        let html_src = r#"<table><tr><td>a</td><td class="w">b</td></tr><tr><td>c</td><td>d</td></tr></table>"#;
+        let css = "table { border-collapse: collapse; width: 200px } \
+                   tr { border-bottom: 1px solid rgb(255, 0, 0) } \
+                   td.w { border-bottom: 3px solid rgb(0, 0, 255) }";
+        let streams = page_streams(html_src, css);
+        let blue = polygon_fills_of(&streams[0], "0 0 1 rg");
+        let (left, right, height) = polygons_extent(&blue);
+        assert!((height - 3.0).abs() < 0.01, "{blue:?}");
+        assert!(right - left < 150.0, "only under the wide cell: {blue:?}");
+        let red = polygon_fills_of(&streams[0], "1 0 0 rg");
+        assert!(!red.is_empty(), "the other cell keeps the row's border");
     }
 
     #[test]

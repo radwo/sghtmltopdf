@@ -515,9 +515,9 @@ RSpec.describe "a Rails controller", type: :rails do
         expect(html).to include(%(@import url("https://example.com/x.css");))
       end
 
-      # Every embedded font is named `/EmbeddedFont` in the PDF, so names cannot
-      # tell them apart. This checks the #45 symptom itself: a failed fetch falls
-      # back to the engine default rather than the next `font-family` candidate.
+      # This checks the #45 symptom itself: a failed fetch falls back to the engine default
+      # rather than the next `font-family` candidate. The fixture is embedded under its own
+      # PostScript name (DejaVuSansMono), not under the "Gyre" family the CSS gives it.
       it "actually applies the font of the redirected @font-face" do
         css = <<~CSS
           @font-face {
@@ -534,6 +534,8 @@ RSpec.describe "a Rails controller", type: :rails do
         without = Sghtmltopdf.render(body)
 
         expect(rewritten).to include("/FontFile2")
+        expect(rewritten).to include("+DejaVuSansMono")
+        expect(verbatim).not_to include("+DejaVuSansMono")
         expect(normalize(verbatim)).to eq(normalize(without))
         expect(normalize(rewritten)).not_to eq(normalize(without))
       end
