@@ -105,7 +105,7 @@ ISO 8601の日付または日時を渡します。オフセットはUTCに直し
 
 カタログの`/Metadata`には、Info辞書と同じ内容のXMPストリームも書かれます
 (`dc:title`、`dc:creator`、`dc:description`、`pdf:Keywords`、`xmp:CreatorTool`、`pdf:Producer`、
-`xmp:CreateDate`、`xmp:ModifyDate`)。圧縮はされず、値はXMLとしてエスケープされたUTF-8です。
+`xmp:CreateDate`、`xmp:ModifyDate`。`/Lang`があれば`dc:language`も)。圧縮はされず、値はXMLとしてエスケープされたUTF-8です。
 指定されなかった項目は書かれません。PDF/Aの識別情報(`pdfaid`)はまだ書きません。
 
 HTMLの`<html lang>`は、PDFカタログの`/Lang`(文書の言語)になります。`en-GB`のような地域つきのタグもそのまま書かれ、`lang`が空または無ければ`/Lang`は書かれません。ヘッダー/フッターのHTMLは影響せず、本文のHTMLだけが決めます。

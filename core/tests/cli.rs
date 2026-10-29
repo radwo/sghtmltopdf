@@ -923,11 +923,13 @@ fn the_xmp_stream_mirrors_the_info_fields() {
             "2026-10-22T10:30:00+02:00",
         ];
         all.extend_from_slice(args);
-        let xmp = xmp_packet(&run_cli_with(PLAIN_HTML, &all, name));
+        let html = "<html lang=\"pl-PL\"><body><p>hello</p></body></html>";
+        let xmp = xmp_packet(&run_cli_with(html, &all, name));
         for expected in [
             "<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">Raport Zażółć</rdf:li></rdf:Alt></dc:title>",
             "<dc:creator><rdf:Seq><rdf:li>Владимир Путин</rdf:li></rdf:Seq></dc:creator>",
             "<rdf:li xml:lang=\"x-default\">A &amp; B &lt;c&gt;</rdf:li>",
+            "<dc:language><rdf:Bag><rdf:li>pl-PL</rdf:li></rdf:Bag></dc:language>",
             "<pdf:Keywords>pdf, \"rust\"</pdf:Keywords>",
             "<xmp:CreatorTool>Acme Reports</xmp:CreatorTool>",
             "<pdf:Producer>sghtmltopdf ",
@@ -950,6 +952,7 @@ fn the_xmp_stream_omits_fields_that_were_not_given() {
         "dc:title",
         "dc:creator",
         "dc:description",
+        "dc:language",
         "pdf:Keywords",
         "xmp:CreatorTool",
     ] {

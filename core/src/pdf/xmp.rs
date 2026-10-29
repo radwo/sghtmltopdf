@@ -36,6 +36,12 @@ pub(super) fn xmp_packet(metadata: &DocumentMetadata, datetime: DateTime) -> Vec
             escape(subject)
         ));
     }
+    if let Some(language) = metadata.language.as_deref() {
+        body.push_str(&format!(
+            "   <dc:language><rdf:Bag><rdf:li>{}</rdf:li></rdf:Bag></dc:language>\n",
+            escape(language)
+        ));
+    }
     if let Some(keywords) = metadata.keywords.as_deref() {
         body.push_str(&format!(
             "   <pdf:Keywords>{}</pdf:Keywords>\n",
