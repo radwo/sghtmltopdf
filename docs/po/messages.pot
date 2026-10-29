@@ -5477,11 +5477,20 @@ msgid ""
 msgstr ""
 
 #: src/supports/selectors.md:140
-msgid ""
-"`@supports` / `@keyframes` / `@namespace` / `@counter-style` / `@container`"
+msgid "`@supports`"
 msgstr ""
 
 #: src/supports/selectors.md:140
+msgid ""
+"条件を評価し、真ならブロックの中のルールを`@media`と同じようにトップレベルへ展開する。`(property: "
+"value)`は宣言パーサーが受理すれば真(値に`var()`を含む場合は既知のプロパティなら真、`!important`は付けてもよい)、`selector(...)`はセレクターが解釈できれば真。`not`・`and`・`or`・括弧で組み合わせられる(`and`と`or`は括弧なしでは混ぜられない)。`font-tech()`・`font-format()`など未知の関数は偽。`@media`・`@layer`とは入れ子にできる"
+msgstr ""
+
+#: src/supports/selectors.md:141
+msgid "`@keyframes` / `@namespace` / `@counter-style` / `@container`"
+msgstr ""
+
+#: src/supports/selectors.md:141
 msgid "ブロックごと無視される"
 msgstr ""
 

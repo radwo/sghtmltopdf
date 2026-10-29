@@ -137,7 +137,8 @@
 | `@charset` | ❌ | 入力はUTF-8前提 |
 | `@layer` | ⚠️ | ブロックの中のルールを書かれた順にトップレベルへ展開する(`@layer a { .x {} }`は`.x {}`と同じ)。レイヤーの優先順位は実装せず、通常のカスケード(詳細度・後勝ち)で決まる。`@layer a, b;`の順序宣言は無視する。Tailwind v4のように出力全体を`@layer`で包むCSSをそのまま渡せる |
 | `@property` | ⚠️ | `syntax`・`inherits`・`initial-value`を読む(`syntax: "*"`では`initial-value`を省略可)。不正なルールは全体を無視し、同名では文書順で最後の有効な登録が勝つ。適用される`@media`と`@layer`の中でも使える。`syntax`は受理するが現在はすべて`"*"`として扱うため、型検査と宣言元要素での`em`等の計算は行わない |
-| `@supports` / `@keyframes` / `@namespace` / `@counter-style` / `@container` | ❌ | ブロックごと無視される |
+| `@supports` | ⚠️ | 条件を評価し、真ならブロックの中のルールを`@media`と同じようにトップレベルへ展開する。`(property: value)`は宣言パーサーが受理すれば真(値に`var()`を含む場合は既知のプロパティなら真、`!important`は付けてもよい)、`selector(...)`はセレクターが解釈できれば真。`not`・`and`・`or`・括弧で組み合わせられる(`and`と`or`は括弧なしでは混ぜられない)。`font-tech()`・`font-format()`など未知の関数は偽。`@media`・`@layer`とは入れ子にできる |
+| `@keyframes` / `@namespace` / `@counter-style` / `@container` | ❌ | ブロックごと無視される |
 
 ## ストリーミングモード固有の制約
 

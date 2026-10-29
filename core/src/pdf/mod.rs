@@ -6,6 +6,7 @@ mod file_id;
 mod font;
 mod img;
 mod options;
+mod outline;
 mod streaming;
 mod svg;
 mod xmp;
@@ -20,5 +21,6 @@ pub use options::{
     current_datetime, current_pdf_date, pdf_date_from_unix, producer_string, unix_from_iso8601,
     DocumentMetadata, PdfOutputOptions, DEFAULT_SCALE,
 };
+pub use outline::Bookmark;
 pub use streaming::StreamingPdfWriter;
 pub use svg::SvgFontDb;

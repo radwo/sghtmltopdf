@@ -6912,13 +6912,33 @@ msgstr ""
 "ordering statement is ignored. A stylesheet that wraps its whole output in "
 "`@layer`, as Tailwind v4 does, can be passed as is"
 
-#: src/supports/selectors.md:130
+#: src/supports/selectors.md:140
+msgid "`@supports`"
+msgstr "`@supports`"
+
+#: src/supports/selectors.md:140
 msgid ""
-"`@supports` / `@keyframes` / `@namespace` / `@counter-style` / "
-"`@container` / `@property`"
+"条件を評価し、真ならブロックの中のルールを`@media`と同じようにトップレベルへ展"
+"開する。`(property: value)`は宣言パーサーが受理すれば真(値に`var()`を含む場合"
+"は既知のプロパティなら真、`!important`は付けてもよい)、`selector(...)`はセレ"
+"クターが解釈できれば真。`not`・`and`・`or`・括弧で組み合わせられる(`and`と`or`"
+"は括弧なしでは混ぜられない)。`font-tech()`・`font-format()`など未知の関数は偽。"
+"`@media`・`@layer`とは入れ子にできる"
 msgstr ""
-"`@supports`, `@keyframes`, `@namespace`, `@counter-style`, `@container`, "
-"`@property`"
+"The condition is evaluated, and when it is true the rules inside the block are "
+"hoisted to the top level, as with `@media`. `(property: value)` is true when "
+"the declaration parser accepts it (with `var()` in the value, when the "
+"property is a known one; `!important` is allowed), and `selector(...)` is "
+"true when the selector parses. They combine with `not`, `and`, `or` and "
+"parentheses (`and` and `or` cannot be mixed without parentheses). Unknown "
+"functions such as `font-tech()` and `font-format()` are false. It nests with "
+"`@media` and `@layer`"
+
+#: src/supports/selectors.md:141
+msgid ""
+"`@keyframes` / `@namespace` / `@counter-style` / `@container`"
+msgstr ""
+"`@keyframes`, `@namespace`, `@counter-style`, `@container`"
 
 #: src/supports/selectors.md:130
 msgid "ブロックごと無視される"
