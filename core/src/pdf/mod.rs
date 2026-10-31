@@ -9,6 +9,7 @@ mod options;
 mod outline;
 mod streaming;
 mod svg;
+mod tagging;
 mod xmp;
 
 pub use document::{
@@ -24,3 +25,4 @@ pub use options::{
 pub use outline::Bookmark;
 pub use streaming::StreamingPdfWriter;
 pub use svg::SvgFontDb;
+pub use tagging::{collect_tag_roles, TagRole};

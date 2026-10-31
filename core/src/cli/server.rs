@@ -36,6 +36,7 @@ const ALLOWED_QUERY_KEYS: &[&str] = &[
     "no-background",
     "no-images",
     "no-pdf-compression",
+    "tagged",
     // PDF metadata
     "title",
     "author",

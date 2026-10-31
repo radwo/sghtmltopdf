@@ -193,6 +193,7 @@ RSpec.describe "matching the CLI's output" do
     ["grayscale", ["--grayscale"], {grayscale: true}],
     ["metadata", ["--title", "請求書", "--author", "わか"], {title: "請求書", author: "わか"}],
     ["no compression", ["--no-pdf-compression"], {no_pdf_compression: true}],
+    ["tagged", ["--tagged"], {tagged: true}],
   ].each do |name, cli_args, gem_options|
     it "produces the same PDF as the CLI with #{name}" do
       html = "<html><head><title>t</title></head><body><h1>見出し</h1><p>本文です。</p></body></html>"

@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use pdf_writer::types::TabOrder;
 use pdf_writer::writers::Catalog;
 use pdf_writer::{Chunk, Content, Filter, Finish, Name, Rect as PdfRect, Ref, TextStr};
 
@@ -36,6 +37,7 @@ use super::font::{deflate, embed_font_streaming_chunks, FontUsage};
 use super::img::{embed_image_streaming_chunks, ids_for_image, ImageIds, PreparedImage};
 use super::options::PdfOutputOptions;
 use super::outline::{collect_bookmark_positions, write_outline, Bookmark, OutlineEntry};
+use super::tagging::{strip_empty_artifacts, Bounds, TagRole, Tagger};
 use super::xmp::xmp_packet;
 
 const PDF_HEADER: &[u8] = b"%PDF-1.7\n%\x80\x80\x80\x80\n\n";
@@ -97,6 +99,8 @@ pub struct StreamingPdfWriter<S: Sink> {
     ///   headers/footers are drawn
     /// * `None`: not specified (the number of pages written so far, plus 1)
     pending_page_number: Option<Option<usize>>,
+    /// Present when writing a tagged PDF (`PdfOutputOptions::tagged`).
+    tagger: Option<Tagger>,
 }
 
 impl<S: Sink> StreamingPdfWriter<S> {
@@ -117,10 +121,15 @@ impl<S: Sink> StreamingPdfWriter<S> {
             page_rules,
             links,
             PdfOutputOptions::default(),
+            HashMap::new(),
         )
     }
 
     /// The version taking an explicit [`PdfOutputOptions`].
+    ///
+    /// `tag_roles` says which elements become which structure elements of a tagged PDF
+    /// ([`PdfOutputOptions::tagged`]), as found by
+    /// [`collect_tag_roles`](super::collect_tag_roles). It is unused otherwise.
     pub fn with_options(
         fonts: &FontCollection,
         settings: PageSettings,
@@ -128,6 +137,7 @@ impl<S: Sink> StreamingPdfWriter<S> {
         page_rules: Vec<PageRule>,
         links: LinkSettings,
         output: PdfOutputOptions,
+        tag_roles: HashMap<NodeId, TagRole>,
     ) -> Result<Self, S::Error> {
         sink.write(PDF_HEADER)?;
         let mut id_hasher = FileIdHasher::new();
@@ -143,6 +153,7 @@ impl<S: Sink> StreamingPdfWriter<S> {
         let usages = (0..fonts.len()).map(|_| FontUsage::default()).collect();
         let alpha_gs_ids: Vec<Ref> = (0..=ALPHA_STEPS).map(|_| alloc.next()).collect();
         let alpha_gs_names: Vec<String> = (0..=ALPHA_STEPS).map(alpha_gs_resource_name).collect();
+        let tagger = output.tagged.then(|| Tagger::new(tag_roles));
 
         let mut writer = Self {
             sink,
@@ -167,6 +178,7 @@ impl<S: Sink> StreamingPdfWriter<S> {
             output,
             pending_overlays: Vec::new(),
             pending_page_number: None,
+            tagger,
         };
         for (step, id) in alpha_gs_ids.into_iter().enumerate() {
             let a = step as f32 / ALPHA_STEPS as f32;
@@ -303,6 +315,9 @@ impl<S: Sink> StreamingPdfWriter<S> {
         let page_id = self.alloc.next();
         let content_id = self.alloc.next();
         self.page_ids.push(page_id);
+        if let Some(tagger) = &mut self.tagger {
+            tagger.begin_page(page_id);
+        }
 
         let mut content = Content::new();
         // The CSS px to PDF pt conversion is done by the page's overall CTM. Every coordinate
@@ -310,7 +325,8 @@ impl<S: Sink> StreamingPdfWriter<S> {
         let scale = self.output.scale;
         content.transform([scale, 0.0, 0.0, scale, 0.0, 0.0]);
         // A wrapper interposing the colour conversion.
-        let mut target = RenderTarget::new(&mut content, self.output.grayscale);
+        let mut target = RenderTarget::new(&mut content, self.output.grayscale)
+            .with_tagger(self.tagger.as_mut());
         // `remaps: None` — CIDs stay the original glyph IDs in streaming mode.
         let text_fonts = TextFonts {
             any_color: self.usages.iter().any(|u| u.color_font_count() > 0),
@@ -333,34 +349,42 @@ impl<S: Sink> StreamingPdfWriter<S> {
                 &mut pending_forms,
             );
         }
+        // The header, footer and margin boxes are page furniture, not document content.
         for overlay in &overlays {
-            render_page_overlay(
-                &mut target,
-                overlay,
-                fonts,
-                &text_fonts,
-                &self.alpha_gs_names,
-                &self.image_ids,
-            );
+            target.as_artifact(|target| {
+                render_page_overlay(
+                    target,
+                    overlay,
+                    fonts,
+                    &text_fonts,
+                    &self.alpha_gs_names,
+                    &self.image_ids,
+                );
+            });
         }
         if numbered {
-            render_header_footer_rules(
-                &mut target,
-                &self.settings,
-                self.output.header_line,
-                self.output.footer_line,
-            );
-            render_margin_boxes(
-                &mut target,
-                &self.settings,
-                fonts,
-                &self.page_rules,
-                page_number,
-                total_pages,
-                &text_fonts,
-            );
+            target.as_artifact(|target| {
+                render_header_footer_rules(
+                    target,
+                    &self.settings,
+                    self.output.header_line,
+                    self.output.footer_line,
+                );
+                render_margin_boxes(
+                    target,
+                    &self.settings,
+                    fonts,
+                    &self.page_rules,
+                    page_number,
+                    total_pages,
+                    &text_fonts,
+                );
+            });
         }
-        let content_bytes = content.finish();
+        let mut content_bytes = content.finish();
+        if self.output.tagged {
+            content_bytes = strip_empty_artifacts(content_bytes);
+        }
         let stream_bytes = if self.output.compress {
             deflate(&content_bytes)
         } else {
@@ -427,12 +451,23 @@ impl<S: Sink> StreamingPdfWriter<S> {
         for area in &page_links {
             let id = self.alloc.next();
             annotation_ids.push(id);
+            // A tagged PDF puts the annotation in the `Link` element over the same text.
+            let struct_parent = self.tagger.as_mut().map(|tagger| {
+                let bounds = Bounds {
+                    x0: area.x0,
+                    y0: area.y0,
+                    x1: area.x1,
+                    y1: area.y1,
+                };
+                tagger.attach_annotation(page_id, &area.href, bounds, id)
+            });
             let mut chunk = Chunk::new();
             write_link_annotation(
                 chunk.annotation(id),
                 area,
                 self.links.annotation_base_href(),
                 self.output.scale,
+                struct_parent,
             );
             self.write_chunk(id, &chunk)?;
         }
@@ -449,6 +484,12 @@ impl<S: Sink> StreamingPdfWriter<S> {
                 self.output.to_pt(self.settings.size.height),
             ));
             p.contents(content_id);
+            if let Some(tagger) = &self.tagger {
+                p.tab_order(TabOrder::StructureOrder);
+                if let Some(key) = tagger.current_page_key() {
+                    p.struct_parents(key);
+                }
+            }
             if !annotation_ids.is_empty() {
                 p.annotations(annotation_ids.iter().copied());
             }
@@ -476,6 +517,9 @@ impl<S: Sink> StreamingPdfWriter<S> {
                     self.settings.size.height,
                 ));
                 form.group().transparency().isolated(true).knockout(false);
+                if let Some(key) = self.tagger.as_ref().and_then(|t| t.form_key(*form_ref)) {
+                    form.struct_parents(key);
+                }
                 write_resources(
                     form.resources(),
                     &self.font_plan,
@@ -546,6 +590,18 @@ impl<S: Sink> StreamingPdfWriter<S> {
             self.write_chunk(dests_id, &chunk)?;
         }
 
+        // The structure tree of a tagged PDF.
+        let mut struct_tree_root = None;
+        if let Some(tagger) = self.tagger.take() {
+            let tree = tagger.write(|| self.alloc.next());
+            if let Some((root_id, objects)) = tree {
+                for (id, chunk) in &objects {
+                    self.write_chunk(*id, chunk)?;
+                }
+                struct_tree_root = Some(root_id);
+            }
+        }
+
         // The outline is written here for the same reason: it needs every entry.
         let entries = std::mem::take(&mut self.outline_entries);
         let mut alloc = std::mem::take(&mut self.alloc);
@@ -577,6 +633,16 @@ impl<S: Sink> StreamingPdfWriter<S> {
             }
             if let Some(language) = self.output.metadata.language.as_deref() {
                 catalog.lang(TextStr(language));
+            }
+            if self.output.tagged {
+                // A tagged PDF is marked even when nothing ended up in the tree (an empty page).
+                catalog.mark_info().marked(true);
+                if let Some(root_id) = struct_tree_root {
+                    catalog.pair(Name(b"StructTreeRoot"), root_id);
+                }
+                if self.output.metadata.title.is_some() {
+                    catalog.viewer_preferences().display_doc_title(true);
+                }
             }
         }
         self.write_chunk(self.catalog_id, &chunk)?;
