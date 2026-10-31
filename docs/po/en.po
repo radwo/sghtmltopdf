@@ -11009,3 +11009,17 @@ msgstr ""
 
 #~ msgid "— (`sghtmltopdf_image_tag`が既定で埋め込むので不要)"
 #~ msgstr "— (not needed: `sghtmltopdf_image_tag` embeds the image by default)"
+
+#: src/usage/cli/reference.md:93
+msgid "`--tagged`"
+msgstr "`--tagged`"
+
+#: src/usage/cli/reference.md:93
+msgid ""
+"タグ付きPDFを出力する。見出し・段落・リスト・表・リンク・代替テキスト付き画像の"
+"構造ツリーを書き、ヘッダー・フッター・背景は`Artifact`にする。`--streaming`と"
+"は併用できない"
+msgstr ""
+"Write a tagged PDF: a structure tree of headings, paragraphs, lists, tables, "
+"links and images with alt text, with headers, footers and backgrounds marked "
+"as `Artifact`. It cannot be combined with `--streaming`"

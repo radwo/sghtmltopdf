@@ -81,6 +81,9 @@ pub struct PdfOutputOptions {
     pub header_line: bool,
     /// Draw a rule above the footer (`--footer-line`).
     pub footer_line: bool,
+    /// Write a tagged PDF (`--tagged`): a structure tree for accessibility, with page furniture
+    /// marked as artifacts. Not supported with `Mode::Streaming`.
+    pub tagged: bool,
 }
 
 impl Default for PdfOutputOptions {
@@ -92,6 +95,7 @@ impl Default for PdfOutputOptions {
             grayscale: false,
             header_line: false,
             footer_line: false,
+            tagged: false,
         }
     }
 }
